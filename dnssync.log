@@ -1,0 +1,22 @@
+2025-03-14 16:44:41,229 - INFO - Logging initialized
+2025-03-14 16:44:41,229 - INFO - Environment initialized.
+2025-03-14 16:44:41,233 - ERROR - Error in main wrapper: No module named 'dnssync_lib.locks'
+2025-03-14 16:47:37,176 - INFO - Logging initialized
+2025-03-14 16:47:37,176 - INFO - Environment initialized.
+2025-03-14 16:47:37,214 - INFO - Logging initialized
+2025-03-14 16:47:37,243 - ERROR - Error in main wrapper: No module named 'requests'
+2025-03-14 16:47:44,081 - INFO - Logging initialized
+2025-03-14 16:47:44,081 - INFO - Environment initialized.
+2025-03-14 16:47:44,087 - INFO - Logging initialized
+2025-03-14 16:47:44,178 - INFO - Lock acquired (PID: 3776)
+2025-03-14 16:47:44,183 - INFO - ================================================================================
+2025-03-14 16:47:44,183 - INFO - RUNNING IN DRY-RUN MODE - NO CHANGES WILL BE MADE
+2025-03-14 16:47:44,183 - INFO - Use --write to apply changes
+2025-03-14 16:47:44,183 - INFO - ================================================================================
+2025-03-14 16:47:44,183 - INFO - Script started.
+2025-03-14 16:47:44,186 - ERROR - Error parsing account data: Expecting value: line 1 column 1 (char 0)
+2025-03-14 16:47:44,186 - INFO - Found 0 affiliated domains in cPanel
+2025-03-14 16:47:44,192 - INFO - Processed 0 domains: 0 success, 0 warning, 0 error
+2025-03-14 16:47:44,192 - INFO - Script completed successfully.
+2025-03-14 16:47:44,192 - INFO - Releasing lock...
+2025-03-14 16:47:44,193 - INFO - Lock file removed
