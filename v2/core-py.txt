@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# File: /opt/scripts/dnssync/core.py
+# Description: DNS Zone Synchronization Workflow Management Engine (modified to use interfaces)
+# Version: 3.4
+
+import sys
+import logging
+import traceback
+from datetime import datetime
+from abc import ABC, abstractmethod
+
+# Import local modules (unchanged)
+from .locks import single_instance, release_lock
+from .logger import setup_logging
+from .utils import parse_arguments
+from .config import get_settings
+from .domains import (
+    get_affiliated_domains, 
+    load_active_zones,
+    load_domain_tracking,
+    save_domain_tracking,
+    process_domain_queue,
+    handle_removed_zones
+)
+from .delegation import check_authoritative_ns
+from .pdns import pdns_req, create_pdns_zone
+from .zones import check_zone_sync, fix_soa_drift
+
+# ----------------------------------------------------------------------
+# Define interface contracts using abstract base classes
+
+class DnsApiInterface(ABC):
+    @abstractmethod
+    def get_zone(self, domain: str) -> dict:
+        pass
+
+    @abstractmethod
+    def update_zone(self, domain: str, zone_data: dict) -> bool:
+        pass
+
+    @abstractmethod
+    def delete_zone(self, domain: str) -> bool:
+        pass
+
+
+class DomainManagerInterface(ABC):
+    @abstractmethod
+    def get_affiliated_domains(self) -> set:
+        pass
+
+    @abstractmethod
+    def process_queue(self, max_domains: int, distribution: tuple, dryrun: bool) -> dict:
+        pass
+
+    @abstractmethod
+    def load_tracking(self) -> dict:
+        pass
+
+    @abstractmethod
+    def save_tracking(self, tracking: dict):
+        pass
+
+# ----------------------------------------------------------------------
+# Adapter implementations (wrapping existing functions)
+
+class PowerDnsApiAdapter(DnsApiInterface):
+    def __init__(self):
+        from .config import get_settings
+        self.settings = get_settings()
+
+    def get_zone(self, domain: str) -> dict:
+        response = pdns_req('GET', domain)
+        if response and response.ok:
+            return response.json()
+        else:
+            raise Exception(f"Failed to get zone for {domain}")
+
+    def update_zone(self, domain: str, zone_data: dict) -> bool:
+        response = pdns_req('PUT', domain, zone_data)
+        return response is not None and response.ok
+
+    def delete_zone(self, domain: str) -> bool:
+        response = pdns_req('DELETE', domain)
+        return response is not None and response.ok
+
+
+class DomainManagerAdapter(DomainManagerInterface):
+    def get_affiliated_domains(self) -> set:
+        return get_affiliated_domains()
+
+    def process_queue(self, max_domains: int, distribution: tuple, dryrun: bool) -> dict:
+        return process_domain_queue(max_domains, distribution, dryrun)
+
+    def load_tracking(self) -> dict:
+        return load_domain_tracking()
+
+    def save_tracking(self, tracking: dict):
+        save_domain_tracking(tracking)
+
+# ----------------------------------------------------------------------
+# Core orchestration using the interfaces
+
+def main(dns_api: DnsApiInterface, domain_manager: DomainManagerInterface):
+    """Main function to run the DNS synchronization process using injected dependencies"""
+    # Parse command-line arguments
+    args = parse_arguments()
+    
+    # Set up logging
+    setup_logging(args.silent, args.log)
+    
+    # Ensure only one instance is running
+    lock_file = single_instance()
+    
+    # Get settings (for other purposes)
+    settings = get_settings()
+    
+    # Inform about dry-run or write mode
+    if args.dryrun:
+        logging.info("=" * 80)
+        logging.info("RUNNING IN DRY-RUN MODE - NO CHANGES WILL BE MADE")
+        logging.info("Use --write to apply changes")
+        logging.info("=" * 80)
+    else:
+        logging.info("=" * 80)
+        logging.info("RUNNING IN WRITE MODE - CHANGES WILL BE APPLIED")
+        logging.info("=" * 80)
+    
+    logging.info("Script started.")
+    
+    try:
+        if args.domain:
+            # Single domain processing
+            logging.info(f"Processing single domain: {args.domain}")
+            excluded_domains = settings['excluded_domains']
+            if args.domain in excluded_domains:
+                logging.info(f"{args.domain} explicitly excluded.")
+                sys.exit(0)
+            
+            ns_result = check_authoritative_ns(args.domain)
+            if not ns_result['verified']:
+                logging.error(f"{args.domain} does not have correct NS records or delegation.")
+                for error in ns_result.get('errors', []):
+                    logging.error(f"- {error}")
+                sys.exit(1)
+            
+            response = pdns_req('GET', args.domain)
+            if response and response.status_code == 404:
+                create_pdns_zone(args.domain, args.dryrun, verbose=True)
+            elif response and response.ok:
+                zone = response.json()
+                if args.stepbystep:
+                    proceed = input(f"Check zone sync for {args.domain}? (y/n): ").strip().lower() == 'y'
+                    if not proceed:
+                        sys.exit(0)
+                sync_status = check_zone_sync(args.domain)
+                if sync_status['sync_status'] != 'success':
+                    logging.warning(f"Sync issues detected for {args.domain}: {sync_status['error_message']}")
+                    if sync_status['soa_drift'] and sync_status['soa_drift'] > settings['max_soa_drift']:
+                        logging.error(f"Critical SOA drift detected: {sync_status['soa_drift']}")
+                        if args.stepbystep:
+                            proceed = input(f"Attempt to fix SOA drift for {args.domain}? (y/n): ").strip().lower() == 'y'
+                            if not proceed:
+                                sys.exit(0)
+                        success, message = fix_soa_drift(
+                            args.domain,
+                            sync_status['bind_serial'],
+                            sync_status['pdns_serial'],
+                            args.dryrun
+                        )
+                        if success:
+                            logging.info(f"SOA drift correction: {message}")
+                        else:
+                            logging.error(f"Failed to fix SOA drift: {message}")
+                else:
+                    logging.info(f"Zone {args.domain} is in sync!")
+                
+                tracking = load_domain_tracking()
+                tracking[args.domain] = {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "active"
+                }
+                save_domain_tracking(tracking)
+            else:
+                logging.error(f"Error checking domain in PowerDNS: {getattr(response, 'text', 'N/A')}")
+        
+        elif args.cleanup:
+            logging.info("Running cleanup process for inactive domains")
+            handle_removed_zones(args.dryrun)
+        
+        elif args.orphans:
+            logging.info("Processing orphaned domains")
+            tracking = load_domain_tracking()
+            orphan_domains = [domain for domain, info in tracking.items() if info['status'] == 'orphan']
+            if orphan_domains:
+                logging.info(f"Found {len(orphan_domains)} orphaned domains")
+                for domain in orphan_domains:
+                    logging.info(f"Checking orphaned domain: {domain}")
+                    ns_result = check_authoritative_ns(domain)
+                    if ns_result['verified']:
+                        logging.info(f"Orphaned domain {domain} now resolves correctly, marking as active")
+                        tracking[domain]['status'] = 'active'
+                        tracking[domain]['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    elif ns_result.get('errors'):
+                        logging.info(f"Orphaned domain {domain} still has delegation issues:")
+                        for error in ns_result.get('errors', []):
+                            logging.info(f"- {error}")
+                save_domain_tracking(tracking)
+            else:
+                logging.info("No orphaned domains found")
+        
+        else:
+            # Bulk processing of affiliated domains
+            affiliated = domain_manager.get_affiliated_domains()
+            logging.info(f"Found {len(affiliated)} affiliated domains in cPanel")
+            active_tracking = load_active_zones()
+            new_domains = affiliated - active_tracking
+            if new_domains:
+                logging.info(f"Found {len(new_domains)} new domains to process")
+            
+            tracking = domain_manager.load_tracking()
+            for domain in affiliated:
+                if domain not in tracking:
+                    tracking[domain] = {
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "status": "active"
+                    }
+            removed = {domain for domain, info in tracking.items() if info['status'] == 'active'} - affiliated
+            if removed:
+                logging.info(f"Found {len(removed)} domains removed from cPanel")
+                for domain in removed:
+                    tracking[domain]["status"] = "inactive"
+                    tracking[domain]["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    logging.info(f"Marked {domain} as inactive")
+            
+            results = domain_manager.process_queue(max_domains=10, distribution=(4,4,2), dryrun=args.dryrun)
+            domain_manager.save_tracking(tracking)
+            handle_removed_zones(args.dryrun)
+        
+        logging.info("Script completed successfully.")
+    
+    except Exception as e:
+        logging.error(f"Error during execution: {str(e)}")
+        logging.error(traceback.format_exc())
+        sys.exit(1)
+    finally:
+        release_lock()
+
+# If this module is run directly, call main with adapter instances
+if __name__ == "__main__":
+    # Instantiate adapters and inject dependencies
+    dns_api_adapter = PowerDnsApiAdapter()
+    domain_manager_adapter = DomainManagerAdapter()
+    main(dns_api_adapter, domain_manager_adapter)
